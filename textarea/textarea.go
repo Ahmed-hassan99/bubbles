@@ -3,6 +3,7 @@ package textarea
 import (
 	"crypto/sha256"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"unicode"
@@ -61,6 +62,10 @@ type KeyMap struct {
 	CapitalizeWordForward key.Binding
 
 	TransposeCharacterBackward key.Binding
+
+	AcceptSuggestion key.Binding
+	NextSuggestion   key.Binding
+	PrevSuggestion   key.Binding
 }
 
 // DefaultKeyMap is the default set of key bindings for navigating and acting
@@ -70,8 +75,8 @@ var DefaultKeyMap = KeyMap{
 	CharacterBackward:       key.NewBinding(key.WithKeys("left", "ctrl+b"), key.WithHelp("left", "character backward")),
 	WordForward:             key.NewBinding(key.WithKeys("alt+right", "alt+f"), key.WithHelp("alt+right", "word forward")),
 	WordBackward:            key.NewBinding(key.WithKeys("alt+left", "alt+b"), key.WithHelp("alt+left", "word backward")),
-	LineNext:                key.NewBinding(key.WithKeys("down", "ctrl+n"), key.WithHelp("down", "next line")),
-	LinePrevious:            key.NewBinding(key.WithKeys("up", "ctrl+p"), key.WithHelp("up", "previous line")),
+	LineNext:                key.NewBinding(key.WithKeys("down"), key.WithHelp("down", "next line")),
+	LinePrevious:            key.NewBinding(key.WithKeys("up"), key.WithHelp("up", "previous line")),
 	DeleteWordBackward:      key.NewBinding(key.WithKeys("alt+backspace", "ctrl+w"), key.WithHelp("alt+backspace", "delete word backward")),
 	DeleteWordForward:       key.NewBinding(key.WithKeys("alt+delete", "alt+d"), key.WithHelp("alt+delete", "delete word forward")),
 	DeleteAfterCursor:       key.NewBinding(key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "delete after cursor")),
@@ -88,6 +93,10 @@ var DefaultKeyMap = KeyMap{
 	CapitalizeWordForward: key.NewBinding(key.WithKeys("alt+c"), key.WithHelp("alt+c", "capitalize word forward")),
 	LowercaseWordForward:  key.NewBinding(key.WithKeys("alt+l"), key.WithHelp("alt+l", "lowercase word forward")),
 	UppercaseWordForward:  key.NewBinding(key.WithKeys("alt+u"), key.WithHelp("alt+u", "uppercase word forward")),
+
+	AcceptSuggestion: key.NewBinding(key.WithKeys("tab", "ctrl+y")),
+	NextSuggestion:   key.NewBinding(key.WithKeys("down", "ctrl+n")),
+	PrevSuggestion:   key.NewBinding(key.WithKeys("up", "ctrl+p")),
 
 	TransposeCharacterBackward: key.NewBinding(key.WithKeys("ctrl+t"), key.WithHelp("ctrl+t", "transpose character backward")),
 }
@@ -233,6 +242,18 @@ type Model struct {
 	// there's no limit.
 	MaxWidth int
 
+	SyntaxHighlighter func(string) string
+	Formatter         func(string) string
+
+	// Should the input suggest to complete
+	ShowSuggestions bool
+
+	// suggestions is a list of suggestions that may be used to complete the
+	// input.
+	suggestions            [][][]rune
+	matchedSuggestions     [][][]rune
+	currentSuggestionIndex int
+
 	// If promptFunc is set, it replaces Prompt as a generator for
 	// prompt strings at the beginning of each line.
 	promptFunc func(line int) string
@@ -296,10 +317,11 @@ func New() Model {
 		Cursor:               cur,
 		KeyMap:               DefaultKeyMap,
 
-		value: make([][]rune, minHeight, defaultMaxHeight),
-		focus: false,
-		col:   0,
-		row:   0,
+		suggestions: [][][]rune{},
+		value:       make([][]rune, minHeight, defaultMaxHeight),
+		focus:       false,
+		col:         0,
+		row:         0,
 
 		viewport: &vp,
 	}
@@ -341,6 +363,18 @@ func DefaultStyles() (Style, Style) {
 func (m *Model) SetValue(s string) {
 	m.Reset()
 	m.InsertString(s)
+}
+
+// SetSuggestions sets the suggestions for the input.
+func (m *Model) SetSuggestions(suggestions []string) {
+	m.suggestions = make([][][]rune, len(suggestions))
+	for i, s := range suggestions {
+		for _, line := range strings.Split(s, "\n") {
+			m.suggestions[i] = append(m.suggestions[i], []rune(line))
+		}
+	}
+
+	m.updateSuggestions()
 }
 
 // InsertString inserts a string at the cursor position.
@@ -440,6 +474,7 @@ func (m *Model) insertRunesFromUserInput(runes []rune) {
 	// Finally add the tail at the end of the last line inserted.
 	m.value[m.row] = append(m.value[m.row], tail...)
 
+	m.format()
 	m.SetCursor(m.col)
 }
 
@@ -959,6 +994,17 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Need to check for completion before, because key is configurable and might be double assigned
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if ok && key.Matches(keyMsg, m.KeyMap.AcceptSuggestion) {
+		if m.canAcceptSuggestion() {
+			m.value = m.matchedSuggestions[m.currentSuggestionIndex]
+			m.format()
+			m.row = len(m.value) - 1
+			m.CursorEnd()
+		}
+	}
+
 	// Used to determine if the cursor should blink.
 	oldRow, oldCol := m.cursorLineNumber(), m.col
 
@@ -1035,7 +1081,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.KeyMap.CharacterForward):
 			m.characterRight()
 		case key.Matches(msg, m.KeyMap.LineNext):
-			m.CursorDown()
+			if m.row == 0 {
+				m.nextSuggestion()
+			} else {
+				m.CursorDown()
+			}
 		case key.Matches(msg, m.KeyMap.WordForward):
 			m.wordRight()
 		case key.Matches(msg, m.KeyMap.Paste):
@@ -1043,7 +1093,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.KeyMap.CharacterBackward):
 			m.characterLeft(false /* insideLine */)
 		case key.Matches(msg, m.KeyMap.LinePrevious):
-			m.CursorUp()
+			if m.row == 0 {
+				m.previousSuggestion()
+			} else {
+				m.CursorUp()
+			}
 		case key.Matches(msg, m.KeyMap.WordBackward):
 			m.wordLeft()
 		case key.Matches(msg, m.KeyMap.InputBegin):
@@ -1058,10 +1112,18 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.capitalizeRight()
 		case key.Matches(msg, m.KeyMap.TransposeCharacterBackward):
 			m.transposeLeft()
+		case key.Matches(msg, m.KeyMap.NextSuggestion):
+			m.nextSuggestion()
+		case key.Matches(msg, m.KeyMap.PrevSuggestion):
+			m.previousSuggestion()
 
 		default:
 			m.insertRunesFromUserInput([]rune(msg.Text))
 		}
+
+		// Check again if can be completed
+		// because value might be something that does not match the completion prefix
+		m.updateSuggestions()
 
 	case pasteMsg:
 		m.insertRunesFromUserInput([]rune(msg))
@@ -1085,6 +1147,27 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	m.repositionView()
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m Model) suggestionView(offset int) string {
+	if !m.canAcceptSuggestion() {
+		return ""
+	}
+
+	value := linesToString(m.value)
+	suggestion := linesToString(m.matchedSuggestions[m.currentSuggestionIndex])
+	if len(value) >= len(suggestion) {
+		return ""
+	}
+
+	var lines []string
+	for _, line := range strings.Split(suggestion[len(m.Value())+offset:], "\n") {
+		lines = append(lines, m.style.Placeholder.Inline(true).Render(line))
+	}
+	if len(lines) > m.Height() {
+		m.SetHeight(len(lines) + 1)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // View renders the text area in its current state.
@@ -1115,6 +1198,7 @@ func (m Model) View() string {
 		for wl, wrappedLine := range wrappedLines {
 			prompt := m.getPromptString(displayLine)
 			prompt = m.style.computedPrompt().Render(prompt)
+
 			s.WriteString(style.Render(prompt))
 			displayLine++
 
@@ -1159,19 +1243,51 @@ func (m Model) View() string {
 				padding -= m.width - strwidth
 			}
 			if m.row == l && lineInfo.RowOffset == wl {
-				s.WriteString(style.Render(string(wrappedLine[:lineInfo.ColumnOffset])))
+				ln := string(wrappedLine[:lineInfo.ColumnOffset])
+				if m.SyntaxHighlighter == nil {
+					ln = style.Render(ln)
+				} else {
+					ln = m.SyntaxHighlighter(ln)
+				}
+				s.WriteString(ln)
+
 				if m.col >= len(line) && lineInfo.CharOffset >= m.width {
 					m.Cursor.SetChar(" ")
 					s.WriteString(m.Cursor.View())
+					// XXX: suggestions?
 				} else {
 					m.Cursor.SetChar(string(wrappedLine[lineInfo.ColumnOffset]))
+					if m.canAcceptSuggestion() && len(m.matchedSuggestions) > 0 {
+						suggestion := m.matchedSuggestions[m.currentSuggestionIndex]
+						if len(suggestion) >= m.row {
+							suggestion = suggestion[m.row:]
+						}
+						m.Cursor.TextStyle = m.style.Placeholder
+						if len(suggestion) > m.row && len(suggestion[m.row]) > m.col {
+							m.Cursor.SetChar(string(suggestion[m.row][m.col]))
+						}
+					}
 					s.WriteString(style.Render(m.Cursor.View()))
 					s.WriteString(style.Render(string(wrappedLine[lineInfo.ColumnOffset+1:])))
+					s.WriteString(m.suggestionView(1))
+					// XXX: suggestions
 				}
 			} else {
-				s.WriteString(style.Render(string(wrappedLine)))
+				ln := string(wrappedLine)
+				if m.SyntaxHighlighter == nil {
+					ln = style.Render(ln)
+				} else {
+					ln = m.SyntaxHighlighter(ln)
+				}
+				s.WriteString(ln)
 			}
-			s.WriteString(style.Render(strings.Repeat(" ", max(0, padding))))
+
+			pad := strings.Repeat(" ", max(0, padding))
+			if m.SyntaxHighlighter == nil {
+				s.WriteString(style.Render(pad))
+			} else {
+				s.WriteString(pad)
+			}
 			s.WriteRune('\n')
 			newLines++
 		}
@@ -1379,7 +1495,68 @@ func (m *Model) splitLine(row, col int) {
 	m.value[row+1] = tail
 
 	m.col = 0
+	m.SetHeight(m.row + 2)
 	m.row++
+}
+
+// canAcceptSuggestion returns whether there is an acceptable suggestion to
+// autocomplete the current value.
+func (m *Model) canAcceptSuggestion() bool {
+	return len(m.matchedSuggestions) > 0
+}
+
+// updateSuggestions refreshes the list of matching suggestions.
+func (m *Model) updateSuggestions() {
+	if !m.ShowSuggestions {
+		return
+	}
+
+	if len(m.value) <= 0 || len(m.suggestions) <= 0 {
+		m.matchedSuggestions = [][][]rune{}
+		return
+	}
+
+	// TODO: this should be better
+	matches := [][][]rune{}
+	for _, s := range m.suggestions {
+		suggestion := linesToString(s)
+
+		if strings.HasPrefix(strings.ToLower(suggestion), strings.ToLower(linesToString(m.value))) {
+			matches = append(matches, s)
+		}
+	}
+	if !reflect.DeepEqual(matches, m.matchedSuggestions) {
+		m.currentSuggestionIndex = 0
+	}
+
+	m.matchedSuggestions = matches
+}
+
+// nextSuggestion selects the next suggestion.
+func (m *Model) nextSuggestion() {
+	m.currentSuggestionIndex = (m.currentSuggestionIndex + 1)
+	if m.currentSuggestionIndex >= len(m.matchedSuggestions) {
+		m.currentSuggestionIndex = 0
+	}
+}
+
+// previousSuggestion selects the previous suggestion.
+func (m *Model) previousSuggestion() {
+	m.currentSuggestionIndex = (m.currentSuggestionIndex - 1)
+	if m.currentSuggestionIndex < 0 {
+		m.currentSuggestionIndex = len(m.matchedSuggestions) - 1
+	}
+}
+
+func (m *Model) format() {
+	if m.Formatter == nil {
+		return
+	}
+	m.value = stringToLines(m.Formatter(linesToString(m.value)))
+	m.row = len(m.value) - 1
+	if m.col > len(m.value[m.row]) {
+		m.col = len(m.value[m.row]) - 1
+	}
 }
 
 // Paste is a command for pasting from the clipboard into the text input.
@@ -1479,4 +1656,20 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func stringToLines(s string) [][]rune {
+	var r [][]rune
+	for _, line := range strings.Split(s, "\n") {
+		r = append(r, []rune(line))
+	}
+	return r
+}
+
+func linesToString(lines [][]rune) string {
+	var result []string
+	for _, line := range lines {
+		result = append(result, string(line))
+	}
+	return strings.Join(result, "\n")
 }
